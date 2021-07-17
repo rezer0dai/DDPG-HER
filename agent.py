@@ -5,8 +5,6 @@ from models import Actor, Critic
 from memory import Memory
 from torch.optim import Adam
 from mpi4py import MPI
-from normalizer import Normalizer
-
 
 class Agent:
     def __init__(self, n_states, n_actions, n_goals, action_bounds, capacity, env,
@@ -45,18 +43,10 @@ class Agent:
         self.actor_optim = Adam(self.actor.parameters(), self.actor_lr)
         self.critic_optim = Adam(self.critic.parameters(), self.critic_lr)
 
-        self.state_normalizer = Normalizer(self.n_states[0], default_clip_range=5)
-        self.goal_normalizer = Normalizer(self.n_goals, default_clip_range=5)
-
-    def choose_action(self, state, goal, train_mode=True):
-        state = self.state_normalizer.normalize(state)
-        goal = self.goal_normalizer.normalize(goal)
-        state = np.expand_dims(state, axis=0)
-        goal = np.expand_dims(goal, axis=0)
+    def choose_action(self, achieved, state, goal, train_mode=True):
+        x = self.memory.normalize_state(state, goal)
 
         with torch.no_grad():
-            x = np.concatenate([state, goal], axis=1)
-            x = from_numpy(x).float().to(self.device)
             action = self.actor(x)[0].cpu().data.numpy()
 
         if train_mode:
@@ -72,7 +62,6 @@ class Agent:
     def store(self, mini_batch):
         for batch in mini_batch:
             self.memory.add(batch)
-        self._update_normalizer(mini_batch)
 
     def init_target_networks(self):
         self.hard_update_networks(self.actor, self.actor_target)
@@ -88,18 +77,7 @@ class Agent:
             t_params.data.copy_(tau * e_params.data + (1 - tau) * t_params.data)
 
     def train(self):
-        states, actions, rewards, next_states, goals = self.memory.sample(self.batch_size)
-
-        states = self.state_normalizer.normalize(states)
-        next_states = self.state_normalizer.normalize(next_states)
-        goals = self.goal_normalizer.normalize(goals)
-        inputs = np.concatenate([states, goals], axis=1)
-        next_inputs = np.concatenate([next_states, goals], axis=1)
-
-        inputs = torch.Tensor(inputs).to(self.device)
-        rewards = torch.Tensor(rewards).to(self.device)
-        next_inputs = torch.Tensor(next_inputs).to(self.device)
-        actions = torch.Tensor(actions).to(self.device)
+        inputs, actions, rewards, next_inputs = self.memory.sample(self.batch_size)
 
         with torch.no_grad():
             target_q = self.critic_target(next_inputs, self.actor_target(next_inputs))
@@ -126,25 +104,10 @@ class Agent:
         return actor_loss.item(), critic_loss.item()
 
     def save_weights(self):
-        torch.save({"actor_state_dict": self.actor.state_dict(),
-                    "state_normalizer_mean": self.state_normalizer.mean,
-                    "state_normalizer_std": self.state_normalizer.std,
-                    "goal_normalizer_mean": self.goal_normalizer.mean,
-                    "goal_normalizer_std": self.goal_normalizer.std}, "FetchPickAndPlace.pth")
+        pass
 
     def load_weights(self):
-
-        checkpoint = torch.load("FetchPickAndPlace.pth")
-        actor_state_dict = checkpoint["actor_state_dict"]
-        self.actor.load_state_dict(actor_state_dict)
-        state_normalizer_mean = checkpoint["state_normalizer_mean"]
-        self.state_normalizer.mean = state_normalizer_mean
-        state_normalizer_std = checkpoint["state_normalizer_std"]
-        self.state_normalizer.std = state_normalizer_std
-        goal_normalizer_mean = checkpoint["goal_normalizer_mean"]
-        self.goal_normalizer.mean = goal_normalizer_mean
-        goal_normalizer_std = checkpoint["goal_normalizer_std"]
-        self.goal_normalizer.std = goal_normalizer_std
+        assert False
 
     def set_to_eval_mode(self):
         self.actor.eval()
@@ -153,14 +116,6 @@ class Agent:
     def update_networks(self):
         self.soft_update_networks(self.actor, self.actor_target, self.tau)
         self.soft_update_networks(self.critic, self.critic_target, self.tau)
-
-    def _update_normalizer(self, mini_batch):
-        states, goals = self.memory.sample_for_normalization(mini_batch)
-
-        self.state_normalizer.update(states)
-        self.goal_normalizer.update(goals)
-        self.state_normalizer.recompute_stats()
-        self.goal_normalizer.recompute_stats()
 
     @staticmethod
     def sync_networks(network):

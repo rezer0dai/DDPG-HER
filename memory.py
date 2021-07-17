@@ -1,93 +1,74 @@
-import numpy as np
-from copy import deepcopy as dc
 import random
+import numpy as np
+import torch
 
+import config
+import normalizer
+state_norm = normalizer.GlobalNormalizerWithTime(config.STATE_SIZE)
+state_norm.share_memory()
 
-class Memory:
-    def __init__(self, capacity, k_future, env):
-        self.capacity = capacity
-        self.memory = []
-        self.memory_counter = 0
-        self.memory_length = 0
-        self.env = env
+class Memory(object):
+    def __init__(self, max_size, _k_future, _env, state_dim=config.STATE_SIZE, action_dim=config.ACTION_SIZE):
+        max_size = int(max_size)
+        self.max_size = max_size
+        self.ptr = 0
+        self.size = 0
 
-        self.future_p = 1 - (1. / (1 + k_future))
+        self.state = np.zeros((max_size, state_dim))
+        self.action = np.zeros((max_size, action_dim))
+        self.next_state = np.zeros((max_size, state_dim))
+        self.reward = np.zeros((max_size, 1))
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def add(self, episode_dict):
+        norm_ind = self.ptr
+        action = episode_dict["action"]
+        reward = np.asarray(episode_dict["reward"])
+        state = np.concatenate([ episode_dict["state"], episode_dict["desired_goal"] ], 1)
+        next_state = np.concatenate([ episode_dict["next_state"], episode_dict["desired_goal"][1:] ], 1)
+
+        for _ in range(config.HER_PER_EP):
+            for j in range(len(action) - 1):
+                state_, next_state_ = state[j].copy(), next_state[j].copy()
+                g = len(episode_dict["desired_goal"][0])
+                assert config.GOAL_SIZE == g
+                state_[-g:] = next_state_[-g:] = random.choice(episode_dict["next_achieved_goal"][j:]).copy()
+                reward_ = -1. * (np.linalg.norm(episode_dict["next_achieved_goal"][j][:g] - state_[-g:]) > .05)
+                self._add(state_, action[j], next_state_, reward_)
+
+            if random.random() < config.HER_RATIO:
+                continue
+            for i in range(len(action)):
+                self._add(state[i], action[i], next_state[i], reward[i])
+
+        if self.ptr > norm_ind:
+            state_norm.update(torch.from_numpy(self.state[norm_ind:self.ptr]))
+
+    def _add(self, state, action, next_state, reward):
+        self.state[self.ptr] = state
+        self.action[self.ptr] = action
+        self.next_state[self.ptr] = next_state
+        self.reward[self.ptr] = reward
+        self.ptr = (self.ptr + 1) % self.max_size
+        self.size = min(self.size + 1, self.max_size)
+
 
     def sample(self, batch_size):
+        ind = np.random.randint(0, self.size, size=batch_size)
 
-        ep_indices = np.random.randint(0, len(self.memory), batch_size)
-        time_indices = np.random.randint(0, len(self.memory[0]["next_state"]), batch_size)
-        states = []
-        actions = []
-        desired_goals = []
-        next_states = []
-        next_achieved_goals = []
+        return (
+            state_norm(torch.from_numpy(self.state[ind])),
+            torch.FloatTensor(self.action[ind]).to(self.device),
+            torch.FloatTensor(self.reward[ind]).to(self.device),
+            state_norm(torch.from_numpy(self.next_state[ind])),
+            )
 
-        for episode, timestep in zip(ep_indices, time_indices):
-            states.append(dc(self.memory[episode]["state"][timestep]))
-            actions.append(dc(self.memory[episode]["action"][timestep]))
-            desired_goals.append(dc(self.memory[episode]["desired_goal"][timestep]))
-            next_achieved_goals.append(dc(self.memory[episode]["next_achieved_goal"][timestep]))
-            next_states.append(dc(self.memory[episode]["next_state"][timestep]))
-
-        states = np.vstack(states)
-        actions = np.vstack(actions)
-        desired_goals = np.vstack(desired_goals)
-        next_achieved_goals = np.vstack(next_achieved_goals)
-        next_states = np.vstack(next_states)
-
-        her_indices = np.where(np.random.uniform(size=batch_size) < self.future_p)
-        future_offset = np.random.uniform(size=batch_size) * (len(self.memory[0]["next_state"]) - time_indices)
-        future_offset = future_offset.astype(int)
-        future_t = (time_indices + 1 + future_offset)[her_indices]
-
-        future_ag = []
-        for episode, f_offset in zip(ep_indices[her_indices], future_t):
-            future_ag.append(dc(self.memory[episode]["achieved_goal"][f_offset]))
-        future_ag = np.vstack(future_ag)
-
-        desired_goals[her_indices] = future_ag
-        rewards = np.expand_dims(self.env.compute_reward(next_achieved_goals, desired_goals, None), 1)
-
-        return self.clip_obs(states), actions, rewards, self.clip_obs(next_states), self.clip_obs(desired_goals)
-
-    def add(self, transition):
-        self.memory.append(transition)
-        if len(self.memory) > self.capacity:
-            self.memory.pop(0)
-        assert len(self.memory) <= self.capacity
-
-    def __len__(self):
-        return len(self.memory)
+    def normalize_state(self, state, goal):
+        if not config.NORMALIZE:
+            return states
+        return state_norm( torch.cat([torch.from_numpy(state), torch.from_numpy(goal)]).view(1, -1) )
 
     @staticmethod
     def clip_obs(x):
         return np.clip(x, -200, 200)
-
-    def sample_for_normalization(self, batch):
-        size = len(batch[0]["next_state"])
-        ep_indices = np.random.randint(0, len(batch), size)
-        time_indices = np.random.randint(0, len(batch[0]["next_state"]), size)
-        states = []
-        desired_goals = []
-
-        for episode, timestep in zip(ep_indices, time_indices):
-            states.append(dc(batch[episode]["state"][timestep]))
-            desired_goals.append(dc(batch[episode]["desired_goal"][timestep]))
-
-        states = np.vstack(states)
-        desired_goals = np.vstack(desired_goals)
-
-        her_indices = np.where(np.random.uniform(size=size) < self.future_p)
-        future_offset = np.random.uniform(size=size) * (len(batch[0]["next_state"]) - time_indices)
-        future_offset = future_offset.astype(int)
-        future_t = (time_indices + 1 + future_offset)[her_indices]
-
-        future_ag = []
-        for episode, f_offset in zip(ep_indices[her_indices], future_t):
-            future_ag.append(dc(batch[episode]["achieved_goal"][f_offset]))
-        future_ag = np.vstack(future_ag)
-
-        desired_goals[her_indices] = future_ag
-
-        return self.clip_obs(states), self.clip_obs(desired_goals)
