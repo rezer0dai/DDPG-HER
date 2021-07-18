@@ -13,6 +13,9 @@ from copy import deepcopy as dc
 import os
 import torch
 
+
+import config
+
 ENV_NAME = "FetchPickAndPlace-v1"
 INTRO = False
 Train = True
@@ -21,7 +24,7 @@ MAX_EPOCHS = 50
 MAX_CYCLES = 50
 num_updates = 40
 MAX_EPISODES = 2
-memory_size = 7e+5 // 50
+memory_size = config.HER_PER_EP * 7e+5 // 50
 batch_size = 256
 actor_lr = 1e-3
 critic_lr = 1e-3

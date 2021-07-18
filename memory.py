@@ -1,15 +1,16 @@
-import random
 import numpy as np
-import torch
+from copy import deepcopy as dc
+import random
 
 import config
 import normalizer
 state_norm = normalizer.GlobalNormalizerWithTime(config.STATE_SIZE)
 state_norm.share_memory()
 
+
 class Memory(object):
     def __init__(self, max_size, _k_future, _env, state_dim=config.STATE_SIZE, action_dim=config.ACTION_SIZE):
-        max_size = int(max_size)
+        max_size = int(1e7)
         self.max_size = max_size
         self.ptr = 0
         self.size = 0
@@ -21,20 +22,26 @@ class Memory(object):
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    def __len__(self):
+        return self.size
+
     def add(self, episode_dict):
         norm_ind = self.ptr
         action = episode_dict["action"]
         reward = np.asarray(episode_dict["reward"])
-        state = np.concatenate([ episode_dict["state"], episode_dict["desired_goal"] ], 1)
-        next_state = np.concatenate([ episode_dict["next_state"], episode_dict["desired_goal"][1:] ], 1)
+        state = np.concatenate([ dc( episode_dict["state"] ), dc( episode_dict["desired_goal"] ) ], 1)
+        next_state = np.concatenate([ dc( episode_dict["next_state"] ), dc( episode_dict["desired_goal"][1:] ) ], 1)
 
-        for _ in range(config.HER_PER_EP):
-            for j in range(len(action) - 1):
-                state_, next_state_ = state[j].copy(), next_state[j].copy()
+        for _ in range(200):
+            for j in range(len(action) - 2):
+                state_, next_state_ = dc ( state[j] ), dc( next_state[j] )
                 g = len(episode_dict["desired_goal"][0])
                 assert config.GOAL_SIZE == g
-                state_[-g:] = next_state_[-g:] = random.choice(episode_dict["next_achieved_goal"][j:]).copy()
+                ag = dc (random.choice(episode_dict["next_achieved_goal"][j:]) )
+                state_[-g:] = ag
+                next_state_[-g:] = ag
                 reward_ = -1. * (np.linalg.norm(episode_dict["next_achieved_goal"][j][:g] - state_[-g:]) > .05)
+
                 self._add(state_, action[j], next_state_, reward_)
 
             if random.random() < config.HER_RATIO:
@@ -65,7 +72,7 @@ class Memory(object):
             )
 
     def normalize_state(self, state, goal):
-        if not config.NORMALIZE:
+        if False:#not config.NORMALIZE:
             return states
         return state_norm( torch.cat([torch.from_numpy(state), torch.from_numpy(goal)]).view(1, -1) )
 
